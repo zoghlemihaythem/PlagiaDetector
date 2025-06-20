@@ -7,18 +7,10 @@ import multiprocessing
 import queue
 import threading
 
-# External libs for file reading
 import fitz  # PyMuPDF for PDFs
 from docx import Document as DocxDocument
 
-
-# === FILE EXTRACTION SECTION ===
-
 def extract_text_from_file(file):
-    """
-    Extract text from a file-like object based on its MIME type.
-    Supports txt, pdf, docx.
-    """
     try:
         file.seek(0)
         filetype = file.type
@@ -52,18 +44,7 @@ def extract_text_from_file(file):
     except Exception:
         return None
 
-
 def extract_all_texts(files, num_workers=4):
-    """
-    Extract texts from all files in parallel using threads.
-
-    Args:
-        files (list): List of file-like objects with .type attribute.
-        num_workers (int): Number of parallel threads.
-
-    Returns:
-        tuple: (list of texts, list of filenames)
-    """
     texts = []
     filenames = []
 
@@ -80,9 +61,6 @@ def extract_all_texts(files, num_workers=4):
 
     return texts, filenames
 
-
-# === SIMILARITY CALCULATION SECTION ===
-
 def _compute_similarity(args):
     i, j, similarity_matrix, filenames, threshold = args
     sim = similarity_matrix[i, j]
@@ -92,7 +70,6 @@ def _compute_similarity(args):
         'Similarity %': round(sim * 100, 2),
         'Plagiarism Suspected': sim >= threshold
     }
-
 
 def _compute_similarity_batch(args):
     batch_pairs, similarity_matrix, filenames, threshold = args
@@ -107,8 +84,7 @@ def _compute_similarity_batch(args):
         })
     return results
 
-
-def _producer_consumer_worker(q, similarity_matrix, filenames, threshold, result_list, lock):
+def _producer_consumer_worker_with_semaphore(q, similarity_matrix, filenames, threshold, result_list, semaphore):
     while True:
         item = q.get()
         if item is None:
@@ -122,27 +98,12 @@ def _producer_consumer_worker(q, similarity_matrix, filenames, threshold, result
             'Similarity %': round(sim * 100, 2),
             'Plagiarism Suspected': sim >= threshold
         }
-        with lock:
-            result_list.append(result)
+        semaphore.acquire()
+        result_list.append(result)
+        semaphore.release()
         q.task_done()
 
-
 def run_plagiarism_detection(documents, filenames, threshold=0.7, mode='sequential', num_workers=4):
-    """
-    Run plagiarism detection on a list of document texts.
-    Supports sequential, multithreaded (with batching), multiprocessing, producer-consumer.
-
-    Args:
-        documents (list of str): Text contents of documents.
-        filenames (list of str): Corresponding filenames.
-        threshold (float): Similarity threshold for plagiarism (0 to 1).
-        mode (str): 'sequential' | 'multithreaded' | 'multiprocessing' | 'producer_consumer'
-        num_workers (int): Number of parallel threads/processes to use.
-
-    Returns:
-        similarity_matrix (np.ndarray): Cosine similarity matrix.
-        report_df (pd.DataFrame): Dataframe of suspicious pairs.
-    """
     vectorizer = TfidfVectorizer(stop_words='english')
     tfidf_matrix = vectorizer.fit_transform(documents)
     similarity_matrix = cosine_similarity(tfidf_matrix)
@@ -150,7 +111,6 @@ def run_plagiarism_detection(documents, filenames, threshold=0.7, mode='sequenti
     pairs = [(i, j) for i in range(len(documents)) for j in range(i + 1, len(documents))]
 
     if mode == 'multithreaded':
-        # Batching pairs for threads to reduce overhead
         chunk_size = max(1, len(pairs) // num_workers)
         batches = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
         args_list = [(batch, similarity_matrix, filenames, threshold) for batch in batches]
@@ -175,10 +135,11 @@ def run_plagiarism_detection(documents, filenames, threshold=0.7, mode='sequenti
 
         threads = []
         results = []
-        lock = threading.Lock()
+        semaphore = threading.Semaphore(1)  # Binary semaphore for critical section
+
         for _ in range(num_workers):
-            t = threading.Thread(target=_producer_consumer_worker,
-                                 args=(q, similarity_matrix, filenames, threshold, results, lock))
+            t = threading.Thread(target=_producer_consumer_worker_with_semaphore,
+                                 args=(q, similarity_matrix, filenames, threshold, results, semaphore))
             t.start()
             threads.append(t)
 
@@ -187,19 +148,15 @@ def run_plagiarism_detection(documents, filenames, threshold=0.7, mode='sequenti
 
         report_data = results
 
-    else:  # Sequential (default)
+    else:  # Sequential
         args_list = [(i, j, similarity_matrix, filenames, threshold) for (i, j) in pairs]
         report_data = [_compute_similarity(arg) for arg in args_list]
 
     report_df = pd.DataFrame(report_data)
     return similarity_matrix, report_df
 
-
-# === USAGE EXAMPLE ===
-
+# Example usage
 if __name__ == "__main__":
-    # Simulate a list of uploaded file-like objects with 'type' and 'name' attributes,
-    # you should replace this with actual files in your environment, e.g. from Streamlit uploader.
     class DummyFile:
         def __init__(self, path, mime_type):
             self.name = path
@@ -210,19 +167,16 @@ if __name__ == "__main__":
                 return f.read()
 
     files = [
-        # Example usage: add your real file paths here for testing
         # DummyFile("document1.txt", "text/plain"),
         # DummyFile("document2.pdf", "application/pdf"),
         # DummyFile("document3.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
     ]
 
-    # Extract texts in parallel
     documents, filenames = extract_all_texts(files, num_workers=4)
     if not documents:
         print("❌ No valid documents extracted.")
     else:
-        # Run plagiarism detection - recommended mode for large datasets: 'multiprocessing'
         similarity_matrix, report_df = run_plagiarism_detection(
-            documents, filenames, threshold=0.7, mode='multithreaded', num_workers=4
+            documents, filenames, threshold=0.7, mode='producer_consumer', num_workers=4
         )
         print(report_df)
